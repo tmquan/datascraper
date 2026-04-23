@@ -29,11 +29,19 @@ Each output JSON contains:
           {"type": "Title", "text": "...", "bbox": {xmin, ymin, xmax, ymax}},
           ...
         ],
-        "markdown": "..."
+        "markdown": "...",
+        "parse_status": "ok"          # or "failed" (+ "parse_error") if the
+                                       # Nemotron API gave up on this page;
+                                       # rerunning the script retries those.
       }, ...
     ],
     "markdown":    "...all pages joined..."
   }
+
+The script is resumable: output JSONs are rewritten after every page so a
+crash, Ctrl-C, or API outage (e.g. 502s from Nemotron) never loses parsed
+pages. Re-running with the same arguments will only re-parse pages that are
+missing or marked "failed".
 
 Usage:
     export NVIDIA_API_KEY=nvapi-...
@@ -163,7 +171,11 @@ class NemotronParseClient:
         })
 
     def parse_image(self, base64_image: str) -> list[dict[str, Any]]:
-        """Call the model on a single base64-encoded PNG and return block list."""
+        """Call the model on a single base64-encoded PNG and return block list.
+
+        Raises NemotronParseError if every retry fails so the caller can mark
+        the page as unfinished and retry it on the next run.
+        """
         messages = [{
             "role": "user",
             "content": [{
@@ -205,7 +217,11 @@ class NemotronParseClient:
                     )
                     time.sleep(sleep)
         log.error("Nemotron API giving up after %d retries: %s", self.retries, last_err)
-        return []
+        raise NemotronParseError(str(last_err) if last_err else "unknown error")
+
+
+class NemotronParseError(RuntimeError):
+    """Raised when the Nemotron Parse API gives up after all retries."""
 
 
 def _extract_blocks(response_json: dict[str, Any]) -> list[dict[str, Any]]:
@@ -381,64 +397,144 @@ class AnleParser:
 
     # ----- resume / skip -----
 
-    def is_item_complete(self, doc_name: str) -> bool:
-        """A case is complete if its output JSON exists, is valid, and records
-        at least one parsed page."""
+    def _load_existing_record(self, doc_name: str) -> Optional[dict[str, Any]]:
+        """Return the previously written JSON for this case, or None.
+
+        Records from older runs don't carry a ``parse_status`` field; for those
+        we infer it from whether the page produced any blocks. A non-empty
+        block list means the API call succeeded; an empty list almost always
+        means the page was silently dropped after an API failure (e.g. a 502),
+        so we mark it "failed" and the next run will retry just that page.
+        """
         path = self.json_dir / f"{doc_name}.json"
         if not path.exists() or path.stat().st_size == 0:
-            return False
+            return None
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
+            return None
+        for p in data.get("pages") or []:
+            if "parse_status" not in p:
+                p["parse_status"] = "ok" if p.get("blocks") else "failed"
+        return data
+
+    def is_item_complete(self, doc_name: str) -> bool:
+        """A case is complete only if every page was parsed successfully.
+
+        Pages written with ``parse_status == "failed"`` (e.g. from a prior run
+        where the Nemotron API 502'd) are treated as unfinished so they get
+        retried on the next run.
+        """
+        data = self._load_existing_record(doc_name)
+        if not data:
             return False
-        return int(data.get("num_pages", 0)) > 0 and bool(data.get("pages"))
+        num_pages = int(data.get("num_pages", 0))
+        pages = data.get("pages") or []
+        if num_pages <= 0 or len(pages) != num_pages:
+            return False
+        return all(p.get("parse_status") == "ok" for p in pages)
 
     # ----- per-item worker -----
 
-    def process_item(self, task: ParseTask) -> bool:
-        """Parse all pages of one PDF and atomically write the JSON."""
+    def _write_record(self, record: dict[str, Any], out_path: Path) -> None:
+        """Atomically persist the JSON record so a crash keeps partial progress."""
+        tmp_path = out_path.with_suffix(".json.tmp")
+        tmp_path.write_text(
+            json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        tmp_path.rename(out_path)
+
+    def process_item(self, task: ParseTask, resume: bool = True) -> bool:
+        """Parse all pages of one PDF, resuming any unfinished pages in place.
+
+        The JSON record is rewritten after every page so that interrupted runs
+        (process killed, API outage, etc.) can pick up exactly where they left
+        off on the next invocation. When ``resume`` is False, every page is
+        re-parsed from scratch.
+        """
         try:
             num_pages = pdf_num_pages(task.pdf_path)
         except Exception as e:
             log.error("%s: failed to open PDF (%s)", task.doc_name, e)
             return False
 
-        pages: list[dict[str, Any]] = []
+        out_path = self.json_dir / f"{task.doc_name}.json"
+        existing = self._load_existing_record(task.doc_name) if resume else None
+        existing = existing or {}
+        # Keep only pages that parsed successfully previously; everything else
+        # (missing, failed, truncated) will be redone below.
+        prior_ok: dict[int, dict[str, Any]] = {}
+        if resume and int(existing.get("num_pages", 0)) == num_pages:
+            for p in existing.get("pages") or []:
+                if p.get("parse_status") == "ok":
+                    prior_ok[int(p.get("page_number", 0))] = p
+
+        pages: list[dict[str, Any]] = [None] * num_pages  # type: ignore[list-item]
+        for pn, p in prior_ok.items():
+            if 1 <= pn <= num_pages:
+                pages[pn - 1] = p
+
+        resumed = len(prior_ok)
+        if resumed:
+            log.info(
+                "%s: resuming, %d/%d pages already parsed",
+                task.doc_name, resumed, num_pages,
+            )
+
+        def build_record() -> dict[str, Any]:
+            filled = [p for p in pages if p is not None]
+            return {
+                "doc_name": task.doc_name,
+                "source_pdf": str(task.pdf_path.relative_to(self.output_dir)),
+                "model": self.client.model,
+                "parsed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "metadata": task.metadata,
+                "num_pages": num_pages,
+                "pages": filled,
+                "markdown": "\n\n".join(
+                    p["markdown"] for p in filled if p.get("markdown")
+                ),
+            }
+
+        failures = 0
         for page_idx in range(num_pages):
+            if pages[page_idx] is not None:
+                continue
+            page_no = page_idx + 1
+            page_entry: dict[str, Any]
             try:
                 img = pdf_page_to_image(task.pdf_path, page_idx, dpi=self.dpi)
                 b64 = encode_image_to_base64(img)
                 blocks = self.client.parse_image(b64)
+                page_entry = {
+                    "page_number": page_no,
+                    "blocks": blocks,
+                    "markdown": blocks_to_markdown(blocks),
+                    "parse_status": "ok",
+                }
             except Exception as e:
+                failures += 1
                 log.error(
-                    "%s page %d: render/parse failed (%s)",
-                    task.doc_name, page_idx + 1, e,
+                    "%s page %d: render/parse failed (%s); will retry on next run",
+                    task.doc_name, page_no, e,
                 )
-                blocks = []
-            pages.append({
-                "page_number": page_idx + 1,
-                "blocks": blocks,
-                "markdown": blocks_to_markdown(blocks),
-            })
+                page_entry = {
+                    "page_number": page_no,
+                    "blocks": [],
+                    "markdown": "",
+                    "parse_status": "failed",
+                    "parse_error": str(e),
+                }
+            pages[page_idx] = page_entry
+            self._write_record(build_record(), out_path)
 
-        record = {
-            "doc_name": task.doc_name,
-            "source_pdf": str(task.pdf_path.relative_to(self.output_dir)),
-            "model": self.client.model,
-            "parsed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "metadata": task.metadata,
-            "num_pages": num_pages,
-            "pages": pages,
-            "markdown": "\n\n".join(p["markdown"] for p in pages if p["markdown"]),
-        }
-
-        out_path = self.json_dir / f"{task.doc_name}.json"
-        tmp_path = out_path.with_suffix(".json.tmp")
-        tmp_path.write_text(
-            json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        tmp_path.rename(out_path)
-        total_blocks = sum(len(p["blocks"]) for p in pages)
+        total_blocks = sum(len(p.get("blocks") or []) for p in pages if p)
+        if failures:
+            log.warning(
+                "%s: %d pages, %d blocks, %d failed -> %s (rerun to resume)",
+                task.doc_name, num_pages, total_blocks, failures, out_path.name,
+            )
+            return False
         log.info(
             "%s: %d pages, %d blocks -> %s",
             task.doc_name, num_pages, total_blocks, out_path.name,
@@ -480,7 +576,9 @@ class AnleParser:
         success = 0
         failed = 0
         with ThreadPoolExecutor(max_workers=self.num_workers) as ex:
-            futures = {ex.submit(self.process_item, t): t for t in pending}
+            futures = {
+                ex.submit(self.process_item, t, resume): t for t in pending
+            }
             for fut in as_completed(futures):
                 task = futures[fut]
                 try:
@@ -518,7 +616,7 @@ def main():
     )
     parser.add_argument(
         "--no-resume", action="store_true",
-        help="Re-parse PDFs even if their JSON already exists.",
+        help="Re-parse every page from scratch, ignoring previously saved JSON.",
     )
     parser.add_argument(
         "--api-url", type=str, default=os.environ.get("NVAI_URL", DEFAULT_NVAI_URL),
