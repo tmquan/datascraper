@@ -21,10 +21,10 @@ import re
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from html import unescape
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 from urllib.parse import unquote
 
 import requests
@@ -101,6 +101,81 @@ class CaseMetadata:
     pdf_filename: str = ""       # Original PDF filename from download link
     pdf_saved_as: str = ""       # Actual filename saved on disk
     pdf_size_bytes: int = 0
+    matched_categories: list = field(default_factory=list)  # e.g. ["fraud", "murder"]
+
+
+# ----- category filters -----
+
+# Preset category -> Vietnamese keywords (as they appear in site metadata).
+# Extend freely; matching is case-insensitive with NFC normalization.
+CATEGORY_KEYWORDS: dict[str, list[str]] = {
+    "fraud": [
+        "lừa đảo chiếm đoạt tài sản",  # Art. 174 - fraud
+        "lừa đảo",
+        "lừa dối khách hàng",           # Art. 198 - consumer fraud
+        "lạm dụng tín nhiệm chiếm đoạt tài sản",  # Art. 175 - breach of trust
+    ],
+    "murder": [
+        "giết người",                   # Art. 123 - murder
+        "giết người trong trạng thái tinh thần bị kích động mạnh",  # Art. 125
+        "giết hoặc vứt bỏ con mới đẻ",  # Art. 124 - infanticide
+        "giết người do vượt quá giới hạn phòng vệ chính đáng",     # Art. 126
+    ],
+}
+
+
+def _normalize(s: str) -> str:
+    """Lower-case + NFC-normalize for tolerant substring matching."""
+    return unicodedata.normalize("NFC", (s or "")).lower()
+
+
+def case_matches(meta: "CaseMetadata", keyword_groups: dict[str, list[str]]) -> list[str]:
+    """Return the list of category names that match this case.
+
+    Scans the metadata fields most likely to describe the offence. Matching is
+    substring-based so e.g. "lừa đảo" also fires on "Tội lừa đảo ...".
+    """
+    if not keyword_groups:
+        return []
+    haystack = _normalize(" | ".join([
+        meta.ten_ban_an,
+        meta.quan_he_phap_luat,
+        meta.loai_vu_viec,
+        meta.thong_tin_vu_viec,
+        meta.ban_an_so,
+    ]))
+    hits: list[str] = []
+    for category, keywords in keyword_groups.items():
+        for kw in keywords:
+            if _normalize(kw) in haystack:
+                hits.append(category)
+                break
+    return hits
+
+
+def resolve_filter(
+    categories: Iterable[str] | None,
+    extra_keywords: Iterable[str] | None,
+) -> dict[str, list[str]]:
+    """Build a {category: [keywords]} dict from CLI flags.
+
+    Unknown preset names raise ValueError so typos fail loudly.
+    """
+    result: dict[str, list[str]] = {}
+    for cat in (categories or []):
+        cat = cat.strip().lower()
+        if not cat:
+            continue
+        if cat not in CATEGORY_KEYWORDS:
+            raise ValueError(
+                f"Unknown category preset: {cat!r}. "
+                f"Known presets: {sorted(CATEGORY_KEYWORDS)}"
+            )
+        result[cat] = list(CATEGORY_KEYWORDS[cat])
+    extras = [k.strip() for k in (extra_keywords or []) if k.strip()]
+    if extras:
+        result.setdefault("custom", []).extend(extras)
+    return result
 
 
 # ----- string helpers -----
@@ -285,6 +360,7 @@ class CongboScraper:
         metadata_only: bool = False,
         batch_size: int = 100,
         proxy: Optional[str] = None,
+        category_filter: Optional[dict[str, list[str]]] = None,
     ):
         self.output_dir = Path(output_dir)
         self.pdf_dir = self.output_dir / "pdfs"
@@ -294,6 +370,11 @@ class CongboScraper:
         self.timeout = timeout
         self.metadata_only = metadata_only
         self.batch_size = batch_size
+        # When set, only cases whose metadata matches one of these category
+        # keyword groups are appended to data.csv/data.json and have their
+        # PDF downloaded. Non-matches are still checkpointed (so we don't
+        # re-fetch them) and their metadata/<id>.json is still written.
+        self.category_filter = category_filter or {}
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.pdf_dir.mkdir(parents=True, exist_ok=True)
@@ -422,23 +503,39 @@ class CongboScraper:
 
     def is_item_complete(self, case_id: int, progress: dict) -> bool:
         """A case is complete iff its metadata JSON is on disk AND (we're in
-        metadata-only mode OR its PDF is on disk). We also require the
-        progress file to have recorded it, so a stray leftover file from an
-        aborted run doesn't cause us to skip retrying.
+        metadata-only / filter mode OR its PDF is on disk). We also require
+        the progress file to have recorded it, so a stray leftover file from
+        an aborted run doesn't cause us to skip retrying.
+
+        Under filter mode we only require a PDF for cases that actually
+        matched the filter; all other cases are considered "complete" once
+        we've seen and classified their metadata.
         """
         if case_id not in progress["completed"]:
             return False
-        if not (self.meta_dir / f"{case_id}.json").exists():
+        meta_path = self.meta_dir / f"{case_id}.json"
+        if not meta_path.exists():
             return False
         if self.metadata_only:
             return True
+        if self.category_filter:
+            try:
+                data = json.loads(meta_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                return False
+            if not data.get("matched_categories"):
+                return True
         return self._find_existing_pdf(case_id) is not None
 
     # ----- per-item worker -----
 
     def process_item(self, case_id: int) -> Optional[CaseMetadata]:
-        """Download metadata + PDF for one case ID. Returns the metadata on
-        success, or None if the case could not be fetched.
+        """Download metadata (+ PDF) for one case ID.
+
+        Returns the metadata on success, or None if the case could not be
+        fetched at all. When ``category_filter`` is set, non-matching cases
+        are returned *with an empty* ``matched_categories`` list so the main
+        loop can checkpoint them without appending to data.csv/data.json.
         """
         meta = self.fetch_metadata(case_id)
         if meta is None:
@@ -451,8 +548,11 @@ class CongboScraper:
             if meta2 and meta2.has_metadata:
                 meta = meta2
             else:
-                if self.metadata_only:
-                    return None
+                # Ghost page without metadata: we can't filter, so skip the
+                # PDF under filter mode and just record the empty metadata.
+                if self.metadata_only or self.category_filter:
+                    self.save_metadata(meta)
+                    return meta
                 time.sleep(self.delay)
                 result = self.download_pdf(case_id, meta)
                 if result:
@@ -462,7 +562,15 @@ class CongboScraper:
                 log.debug("ID %d: no metadata, no PDF", case_id)
                 return None
 
-        if not self.metadata_only:
+        # Category filter: classify first, decide whether to pull the PDF.
+        if self.category_filter:
+            meta.matched_categories = case_matches(meta, self.category_filter)
+
+        skip_pdf = (
+            self.metadata_only
+            or (self.category_filter and not meta.matched_categories)
+        )
+        if not skip_pdf:
             time.sleep(self.delay)
             result = self.download_pdf(case_id, meta)
             if result:
@@ -485,6 +593,62 @@ class CongboScraper:
         """Append one record to data.json as a JSON Lines entry."""
         with open(self.json_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(asdict(meta), ensure_ascii=False) + "\n")
+
+    # ----- offline filter (no network) -----
+
+    def rebuild_filtered(self) -> int:
+        """Rewrite data.csv + data.json from the existing metadata/ dir,
+        keeping only cases that match ``self.category_filter``.
+
+        Useful when you've already scraped a large ID range and want to
+        extract the subset matching a new filter without re-hitting the
+        network.  Returns the number of matched records written.
+        """
+        if not self.category_filter:
+            log.error("rebuild_filtered called without a filter set")
+            return 0
+
+        files = sorted(
+            self.meta_dir.glob("*.json"),
+            key=lambda p: int(p.stem) if p.stem.isdigit() else 0,
+        )
+        log.info("Scanning %d metadata files under %s", len(files), self.meta_dir)
+
+        # Start fresh - these are derived files.
+        if self.csv_file.exists():
+            self.csv_file.unlink()
+        if self.json_file.exists():
+            self.json_file.unlink()
+
+        matched = 0
+        scanned = 0
+        for p in files:
+            scanned += 1
+            try:
+                data = json.loads(p.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            meta = CaseMetadata(**{
+                k: v for k, v in data.items()
+                if k in CaseMetadata.__dataclass_fields__
+            })
+            hits = case_matches(meta, self.category_filter)
+            if not hits:
+                continue
+            meta.matched_categories = hits
+            # Persist the classification back so is_item_complete() sees it.
+            p.write_text(
+                json.dumps(asdict(meta), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            self.append_csv(meta)
+            self.append_json(meta)
+            matched += 1
+            if scanned % 10000 == 0:
+                log.info("Scanned %d, matched %d so far", scanned, matched)
+
+        log.info("Rebuild done: %d / %d metadata files matched", matched, scanned)
+        return matched
 
     # ----- main loop -----
 
@@ -532,19 +696,34 @@ class CongboScraper:
                         cid, meta = future.result()
                         completed.add(cid)
                         last_id = max(last_id, cid)
-                        if meta:
-                            self.append_csv(meta)
-                            self.append_json(meta)
-                            success_count += 1
-                            log.info(
-                                "[%d/%d] ID %d: %s | %s | %s | PDF %d bytes",
-                                success_count, total, cid,
-                                meta.ban_an_so, meta.loai_vu_viec,
-                                meta.toa_an_xet_xu, meta.pdf_size_bytes,
-                            )
-                        else:
+                        if meta is None:
                             failed_count += 1
                             log.debug("[skip] ID %d not found", cid)
+                            continue
+
+                        # Under filter mode, only append matches to the
+                        # aggregate CSV/JSON files. Non-matches are still
+                        # checkpointed (above) so resume skips them.
+                        if self.category_filter and not meta.matched_categories:
+                            log.debug(
+                                "[filter-skip] ID %d: %s | %s",
+                                cid, meta.loai_vu_viec, meta.quan_he_phap_luat,
+                            )
+                            continue
+
+                        self.append_csv(meta)
+                        self.append_json(meta)
+                        success_count += 1
+                        tag = (
+                            f" [{'+'.join(meta.matched_categories)}]"
+                            if meta.matched_categories else ""
+                        )
+                        log.info(
+                            "[%d/%d] ID %d%s: %s | %s | %s | PDF %d bytes",
+                            success_count, total, cid, tag,
+                            meta.ban_an_so, meta.loai_vu_viec,
+                            meta.toa_an_xet_xu, meta.pdf_size_bytes,
+                        )
                     except Exception as e:
                         failed_count += 1
                         log.error("ID %d raised exception: %s", case_id, e)
@@ -579,8 +758,36 @@ def main():
              "socks5h://host:port). Required when running from outside Vietnam; "
              "HTTP_PROXY/HTTPS_PROXY env vars are also honored.",
     )
+    parser.add_argument(
+        "--categories", type=str, default="",
+        help=(
+            "Comma-separated category presets to focus on (e.g. 'fraud,murder'). "
+            f"Known presets: {','.join(sorted(CATEGORY_KEYWORDS))}. "
+            "When set, only matching cases get PDFs downloaded and appended to "
+            "data.csv/data.json; non-matches are still checkpointed so resume works."
+        ),
+    )
+    parser.add_argument(
+        "--keywords", type=str, default="",
+        help="Comma-separated extra Vietnamese keywords to match (in addition "
+             "to --categories). Case-insensitive, NFC-normalized substring match.",
+    )
+    parser.add_argument(
+        "--rebuild-filtered", action="store_true",
+        help="Offline mode: scan existing metadata/*.json and regenerate "
+             "data.csv/data.json restricted to the --categories/--keywords "
+             "filter, without making any network requests.",
+    )
 
     args = parser.parse_args()
+
+    try:
+        category_filter = resolve_filter(
+            categories=args.categories.split(",") if args.categories else [],
+            extra_keywords=args.keywords.split(",") if args.keywords else [],
+        )
+    except ValueError as e:
+        parser.error(str(e))
 
     scraper = CongboScraper(
         output_dir=args.output,
@@ -590,7 +797,20 @@ def main():
         metadata_only=args.metadata_only,
         batch_size=args.batch_size,
         proxy=args.proxy,
+        category_filter=category_filter,
     )
+
+    if category_filter:
+        log.info(
+            "Category filter active: %s",
+            {k: len(v) for k, v in category_filter.items()},
+        )
+
+    if args.rebuild_filtered:
+        if not category_filter:
+            parser.error("--rebuild-filtered requires --categories and/or --keywords")
+        scraper.rebuild_filtered()
+        return
 
     if args.test:
         meta = scraper.process_item(args.test)
