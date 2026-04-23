@@ -261,6 +261,7 @@ class CongboScraper:
         timeout: int = REQUEST_TIMEOUT,
         metadata_only: bool = False,
         batch_size: int = 100,
+        proxy: Optional[str] = None,
     ):
         self.output_dir = Path(output_dir)
         self.pdf_dir = self.output_dir / "pdfs"
@@ -278,6 +279,15 @@ class CongboScraper:
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
         self.session.verify = False
+        # congbobanan.toaan.gov.vn refuses connections from non-VN IPs
+        # (ERR_CONNECTION_CLOSED during TLS handshake). Route through a
+        # Vietnamese proxy via --proxy or HTTP(S)_PROXY env vars. Running
+        # the scraper on a VN-based VPS is the simplest and most reliable
+        # option for long 24/7 crawls.
+        if proxy:
+            self.session.proxies = {"http": proxy, "https": proxy}
+        # If no explicit proxy, requests still honors HTTP_PROXY / HTTPS_PROXY
+        # from the environment through trust_env (default True).
 
         self.progress_file = self.output_dir / "progress.json"
         self.csv_file = self.output_dir / "data.csv"
@@ -528,6 +538,12 @@ def main():
     parser.add_argument("--no-resume", action="store_true", help="Don't resume from previous progress")
     parser.add_argument("--batch-size", type=int, default=100, help="Batch size for progress checkpoints")
     parser.add_argument("--test", type=int, help="Test with a single case ID")
+    parser.add_argument(
+        "--proxy", type=str, default=None,
+        help="HTTP/HTTPS/SOCKS proxy URL (e.g. http://user:pass@host:port, "
+             "socks5h://host:port). Required when running from outside Vietnam; "
+             "HTTP_PROXY/HTTPS_PROXY env vars are also honored.",
+    )
 
     args = parser.parse_args()
 
@@ -538,6 +554,7 @@ def main():
         timeout=args.timeout,
         metadata_only=args.metadata_only,
         batch_size=args.batch_size,
+        proxy=args.proxy,
     )
 
     if args.test:

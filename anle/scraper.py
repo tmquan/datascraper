@@ -156,6 +156,7 @@ class AnleScraper:
         num_workers: int = 2,
         delay: float = 1.0,
         download_pdfs: bool = True,
+        proxy: Optional[str] = None,
     ):
         self.output_dir = Path(output_dir)
         self.pdf_dir = self.output_dir / "pdfs"
@@ -167,6 +168,11 @@ class AnleScraper:
         self.pdf_dir.mkdir(parents=True, exist_ok=True)
 
         self.session = make_session()
+        # anle.toaan.gov.vn is usually globally reachable, but some networks
+        # (or the sibling congbobanan host) may require a VN-based route.
+        # --proxy takes precedence over HTTP_PROXY/HTTPS_PROXY env vars.
+        if proxy:
+            self.session.proxies = {"http": proxy, "https": proxy}
 
         self.progress_file = self.output_dir / "progress.json"
         self.csv_file = self.output_dir / "data.csv"
@@ -494,6 +500,11 @@ def main():
         "--no-resume", action="store_true",
         help="Don't resume from previous progress",
     )
+    parser.add_argument(
+        "--proxy", type=str, default=None,
+        help="HTTP/HTTPS/SOCKS proxy URL (e.g. http://user:pass@host:port, "
+             "socks5h://host:port). HTTP_PROXY/HTTPS_PROXY env vars are also honored.",
+    )
     args = parser.parse_args()
 
     scraper = AnleScraper(
@@ -501,6 +512,7 @@ def main():
         num_workers=args.num_workers,
         delay=args.delay,
         download_pdfs=not args.no_pdf,
+        proxy=args.proxy,
     )
     scraper.run(
         start_id=args.start,
