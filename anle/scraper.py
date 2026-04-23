@@ -64,6 +64,30 @@ class CaseRecord:
     page: int = 0
 
 
+_BLOCK_SIGNATURES = (
+    "UNEXPECTED_EOF_WHILE_READING",
+    "SSLEOFError",
+    "SSLError",
+    "Connection reset by peer",
+    "ConnectionResetError",
+    "Connection aborted",
+    "RemoteDisconnected",
+    "ECONNRESET",
+)
+
+
+def _looks_like_network_block(exc: BaseException) -> bool:
+    """Heuristic: did the TLS/TCP handshake get closed before any HTTP data?
+
+    These signatures come up when a host geo-blocks the source IP or when a
+    middlebox is silently dropping/intercepting the connection. They're
+    indistinguishable at the socket layer but the user-facing fix is the same:
+    route through a reachable egress (VN VPS / VN proxy / corporate proxy).
+    """
+    s = repr(exc)
+    return any(sig in s for sig in _BLOCK_SIGNATURES)
+
+
 def make_session() -> requests.Session:
     session = requests.Session()
     session.verify = False
@@ -203,6 +227,15 @@ class AnleScraper:
                 return resp.text
             except requests.RequestException as e:
                 log.warning("Page %d attempt %d failed: %s", page, attempt + 1, e)
+                if _looks_like_network_block(e):
+                    log.error(
+                        "TLS/connection closed before any data arrived - the "
+                        "host is likely geo-blocking your source IP or a "
+                        "firewall is intercepting the handshake. Run on a "
+                        "VN-based VPS, set --proxy (or HTTPS_PROXY) to a VN "
+                        "exit, or configure your corporate HTTPS proxy."
+                    )
+                    return None
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(RETRY_DELAY * (attempt + 1))
         return None

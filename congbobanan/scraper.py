@@ -47,6 +47,29 @@ HEADERS = {
 
 REQUEST_TIMEOUT = 30
 
+_BLOCK_SIGNATURES = (
+    "UNEXPECTED_EOF_WHILE_READING",
+    "SSLEOFError",
+    "SSLError",
+    "Connection reset by peer",
+    "ConnectionResetError",
+    "Connection aborted",
+    "RemoteDisconnected",
+    "ECONNRESET",
+)
+
+
+def _looks_like_network_block(exc: BaseException) -> bool:
+    """Heuristic: did the TLS/TCP handshake get closed before any HTTP data?
+
+    These signatures come up when a host geo-blocks the source IP or when a
+    middlebox is silently dropping/intercepting the connection. They're
+    indistinguishable at the socket layer but the user-facing fix is the same:
+    route through a reachable egress (VN VPS / VN proxy / corporate proxy).
+    """
+    s = repr(exc)
+    return any(sig in s for sig in _BLOCK_SIGNATURES)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -303,11 +326,23 @@ class CongboScraper:
 
     # ----- networking -----
 
+    _block_hint_shown = False
+
     def _get(self, url: str) -> Optional[requests.Response]:
         try:
             return self.session.get(url, timeout=self.timeout)
         except requests.RequestException as e:
             log.warning("Request failed for %s: %s", url, e)
+            if _looks_like_network_block(e) and not CongboScraper._block_hint_shown:
+                CongboScraper._block_hint_shown = True
+                log.error(
+                    "TLS/connection closed before any data arrived - the host "
+                    "is likely geo-blocking your source IP or a firewall is "
+                    "intercepting the handshake. congbobanan.toaan.gov.vn is "
+                    "reachable from Vietnam only. Run on a VN-based VPS, set "
+                    "--proxy (or HTTPS_PROXY) to a VN exit, or configure your "
+                    "corporate HTTPS proxy."
+                )
             return None
 
     def fetch_metadata(self, case_id: int) -> Optional[CaseMetadata]:
